@@ -42,7 +42,7 @@ export interface RequeueSelectionOptions {
 
 export interface SkippedEvaluation {
   evaluationId: string;
-  reason: "not-a-build-policy" | "not-selected" | "protected-status" | "not-applicable" | "missing-evaluation-id";
+  reason: "not-a-build-policy" | "not-selected" | "protected-status" | "not-applicable" | "not-expired" | "missing-evaluation-id";
   status?: PolicyEvaluationStatus;
   expired?: boolean;
 }
@@ -55,10 +55,11 @@ export interface RequeueSelectionResult {
 /**
  * Selects which build-policy evaluation records on a pull request should be requeued.
  *
- * Non build-policy and NotApplicable evaluations are always skipped. By default, failed/broken
- * build policies and expired build policies are selected. Approved evaluations are protected
- * only while they remain current; queued/running evaluations stay protected. Explicit selection
- * and `force` preserve the opt-in escape hatch for applicable policies.
+ * Non build-policy and NotApplicable evaluations are always skipped. By default, only expired
+ * build policies are selected; Azure DevOps Server can represent these as Queued + isExpired.
+ * Non-expired failures require explicit selection, which prevents business-level non-applicable
+ * validations reported as Rejected from being retried accidentally. Explicit selection and
+ * `force` preserve the opt-in escape hatch for applicable policies.
  */
 export function selectBuildPolicyEvaluationsToRequeue(evaluations: PolicyEvaluationRecord[], options: RequeueSelectionOptions = {}): RequeueSelectionResult {
   const { force = false } = options;
@@ -91,14 +92,17 @@ export function selectBuildPolicyEvaluationsToRequeue(evaluations: PolicyEvaluat
 
     const bypassProtection = force || explicitSelection !== null;
     const expired = isExpiredEvaluation(evaluation);
-    const active = evaluation.status === PolicyEvaluationStatus.Queued || evaluation.status === PolicyEvaluationStatus.Running;
-    const currentApproval = evaluation.status === PolicyEvaluationStatus.Approved && !expired;
-    if ((active || currentApproval) && !bypassProtection) {
+    if (bypassProtection || expired) {
+      toRequeue.push(evaluation);
+      continue;
+    }
+
+    if (isProtectedStatus(evaluation.status)) {
       skipped.push({ evaluationId, reason: "protected-status", status: evaluation.status, expired });
       continue;
     }
 
-    toRequeue.push(evaluation);
+    skipped.push({ evaluationId, reason: "not-expired", status: evaluation.status, expired });
   }
 
   return { toRequeue, skipped };

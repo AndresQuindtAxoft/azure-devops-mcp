@@ -6944,21 +6944,19 @@ describe("repos tools", () => {
       });
     });
 
-    it("requeues a failed build policy and produces the expected PATCH payload", async () => {
+    it("does not requeue a non-expired failed build policy by default", async () => {
       const handler = getHandler();
       const evaluation = buildEvaluation({ evaluationId: "eval-1", status: 3 });
       mockPolicyApi.getPolicyEvaluations.mockResolvedValue([evaluation]);
-      mockPolicyApi.requeuePolicyEvaluation.mockResolvedValue({ ...evaluation, status: 0 });
 
       const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
 
       expect(mockPolicyApi.getPolicyEvaluations).toHaveBeenCalledWith("proj", `vstfs:///CodeReview/CodeReviewId/${PROJECT_ID}/42`, false);
-      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledTimes(1);
-      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-1");
+      expect(mockPolicyApi.requeuePolicyEvaluation).not.toHaveBeenCalled();
 
       const parsed = JSON.parse(result.content[0].text);
-      expect(parsed.requeued).toEqual(["eval-1"]);
-      expect(parsed.skipped).toEqual([]);
+      expect(parsed.requeued).toEqual([]);
+      expect(parsed.skipped).toEqual([{ evaluationId: "eval-1", reason: "not-expired", status: 3, expired: false }]);
       expect(parsed.failed).toEqual([]);
     });
 
@@ -6989,6 +6987,17 @@ describe("repos tools", () => {
       expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-expired");
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.selected).toEqual([{ evaluationId: "eval-expired", status: 2, expired: true, buildId: 2179189 }]);
+    });
+
+    it("requeues an expired Queued build policy", async () => {
+      const handler = getHandler();
+      const expired = buildEvaluation({ evaluationId: "eval-expired", status: 0, context: { isExpired: true, buildId: 2179189 } });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([expired]);
+      mockPolicyApi.requeuePolicyEvaluation.mockResolvedValue({});
+
+      await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-expired");
     });
 
     it("previews expired build policies without requeueing", async () => {
@@ -7075,7 +7084,7 @@ describe("repos tools", () => {
       mockPolicyApi.getPolicyEvaluations.mockResolvedValue([evaluation]);
       mockPolicyApi.requeuePolicyEvaluation.mockRejectedValue(new Error("Server error"));
 
-      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42, evaluationIds: ["eval-1"] });
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.requeued).toEqual([]);

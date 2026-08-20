@@ -1602,7 +1602,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
   server.tool(
     REPO_TOOLS.requeue_pull_request_build_policies,
     "Requeue build validation policy evaluations for a pull request (works against Azure DevOps Services and on-premises Azure DevOps Server / TFS). " +
-      "By default, expired, rejected, or broken build policies are requeued; current Approved, Queued, Running, and NotApplicable policies are left untouched. " +
+      "By default, only expired build policies are requeued, including Azure DevOps Server evaluations represented as Queued + isExpired. " +
+      "Non-expired failures require explicit evaluationIds; NotApplicable policies are always excluded. " +
       "Use 'dryRun: true' to preview the exact evaluations without changing Azure DevOps. " +
       "Pass 'evaluationIds' to explicitly requeue specific evaluations regardless of their current state, or 'force: true' to requeue every build policy on the pull request.",
     {

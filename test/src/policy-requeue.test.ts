@@ -70,12 +70,12 @@ describe("policy-requeue helpers", () => {
   });
 
   describe("selectBuildPolicyEvaluationsToRequeue - selection", () => {
-    it("selects a failed/rejected build policy by default", () => {
+    it("does not select a non-expired rejected build policy by default", () => {
       const evaluation = buildEvaluation({ evaluationId: "eval-1", status: PolicyEvaluationStatus.Rejected });
       const result = selectBuildPolicyEvaluationsToRequeue([evaluation]);
 
-      expect(result.toRequeue).toEqual([evaluation]);
-      expect(result.skipped).toEqual([]);
+      expect(result.toRequeue).toEqual([]);
+      expect(result.skipped).toEqual([{ evaluationId: "eval-1", reason: "not-expired", status: PolicyEvaluationStatus.Rejected, expired: false }]);
     });
 
     it("filters out evaluations that are not build policies", () => {
@@ -119,6 +119,15 @@ describe("policy-requeue helpers", () => {
       expect(result.skipped).toEqual([]);
     });
 
+    it("requeues an expired Queued build policy by default", () => {
+      const expired = buildEvaluation({ evaluationId: "eval-expired-queued", status: PolicyEvaluationStatus.Queued, context: { isExpired: true, buildId: 123 } });
+
+      const result = selectBuildPolicyEvaluationsToRequeue([expired]);
+
+      expect(result.toRequeue).toEqual([expired]);
+      expect(result.skipped).toEqual([]);
+    });
+
     it("never requeues a NotApplicable build policy", () => {
       const notApplicable = buildEvaluation({ evaluationId: "eval-na", status: PolicyEvaluationStatus.NotApplicable, context: { isExpired: true } });
 
@@ -128,14 +137,17 @@ describe("policy-requeue helpers", () => {
       expect(result.skipped).toEqual([{ evaluationId: "eval-na", reason: "not-applicable", status: PolicyEvaluationStatus.NotApplicable, expired: true }]);
     });
 
-    it("does not protect a Rejected or Broken evaluation", () => {
+    it("requires explicit selection for non-expired Rejected or Broken evaluations", () => {
       const rejected = buildEvaluation({ evaluationId: "eval-4", status: PolicyEvaluationStatus.Rejected });
       const broken = buildEvaluation({ evaluationId: "eval-5", status: PolicyEvaluationStatus.Broken });
 
       const result = selectBuildPolicyEvaluationsToRequeue([rejected, broken]);
 
-      expect(result.toRequeue).toEqual([rejected, broken]);
-      expect(result.skipped).toEqual([]);
+      expect(result.toRequeue).toEqual([]);
+      expect(result.skipped).toEqual([
+        { evaluationId: "eval-4", reason: "not-expired", status: PolicyEvaluationStatus.Rejected, expired: false },
+        { evaluationId: "eval-5", reason: "not-expired", status: PolicyEvaluationStatus.Broken, expired: false },
+      ]);
     });
 
     it("bypasses protection for an explicitly selected evaluationId", () => {
