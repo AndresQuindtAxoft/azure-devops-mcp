@@ -5,7 +5,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { getBearerHandler, WebApi } from "azure-devops-node-api";
+import { getBearerHandler, getPersonalAccessTokenHandler, WebApi } from "azure-devops-node-api";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
@@ -58,8 +58,13 @@ const argv = yargs(hideBin(process.argv))
   .help()
   .parseSync();
 
+// ORCA_AZURE_DEVOPS_API_BASE_URL lets an ORCA-provisioned on-premises Azure DevOps Server / TFS
+// deployment override the default dev.azure.com cloud URL without changing how the
+// 'organization' CLI argument is used elsewhere (e.g. tenant lookup, logging).
+const orcaApiBaseUrl = process.env.ORCA_AZURE_DEVOPS_API_BASE_URL;
+
 export const orgName = argv.organization as string;
-const orgUrl = "https://dev.azure.com/" + orgName;
+const orgUrl = orcaApiBaseUrl ? orcaApiBaseUrl.replace(/\/$/, "") : "https://dev.azure.com/" + orgName;
 
 const domainsManager = new DomainsManager(argv.domains);
 export const enabledDomains = domainsManager.getEnabledDomains();
@@ -67,7 +72,9 @@ export const enabledDomains = domainsManager.getEnabledDomains();
 function getAzureDevOpsClient(getAzureDevOpsToken: () => Promise<string>, userAgentComposer: UserAgentComposer): () => Promise<WebApi> {
   return async () => {
     const accessToken = await getAzureDevOpsToken();
-    const authHandler = getBearerHandler(accessToken);
+    // ORCA_AZURE_DEVOPS_TOKEN is a Personal Access Token; it must be sent as HTTP Basic auth
+    // (PAT handler), not as an OAuth Bearer token.
+    const authHandler = process.env.ORCA_AZURE_DEVOPS_TOKEN ? getPersonalAccessTokenHandler(accessToken) : getBearerHandler(accessToken);
     const connection = new WebApi(orgUrl, authHandler, undefined, {
       productName: "AzureDevOps.MCP",
       productVersion: packageVersion,
@@ -103,7 +110,9 @@ async function main() {
   server.server.oninitialized = () => {
     userAgentComposer.appendMcpClientInfo(server.server.getClientVersion());
   };
-  const tenantId = (await getOrgTenant(orgName)) ?? argv.tenant;
+  // Skip the cloud tenant lookup (a network call to dev.azure.com) when an ORCA-provisioned
+  // on-premises base URL or token is in play; tenantId is only meaningful for cloud OAuth/az-cli auth.
+  const tenantId = orcaApiBaseUrl || process.env.ORCA_AZURE_DEVOPS_TOKEN ? argv.tenant : ((await getOrgTenant(orgName)) ?? argv.tenant);
   const authenticator = createAuthenticator(argv.authentication, tenantId);
 
   // removing prompts untill further notice

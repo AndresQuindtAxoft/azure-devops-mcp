@@ -77,6 +77,21 @@ class OAuthAuthenticator {
 
 function createAuthenticator(type: string, tenantId?: string): () => Promise<string> {
   logger.debug(`Creating authenticator of type '${type}' with tenantId='${tenantId ?? "undefined"}'`);
+
+  // Reuse the ORCA-managed Azure DevOps token when present (e.g. on-premises Azure DevOps
+  // Server / TFS deployments provisioned by Orca). Takes precedence over --authentication.
+  // The token value itself is never logged or returned anywhere other than the auth header.
+  if (process.env.ORCA_AZURE_DEVOPS_TOKEN) {
+    logger.debug("Authenticator: Using ORCA_AZURE_DEVOPS_TOKEN environment variable");
+    return async () => {
+      const token = process.env.ORCA_AZURE_DEVOPS_TOKEN;
+      if (!token) {
+        throw new Error("Environment variable 'ORCA_AZURE_DEVOPS_TOKEN' is not set or empty.");
+      }
+      return token;
+    };
+  }
+
   switch (type) {
     case "envvar":
       logger.debug(`Authenticator: Using environment variable authentication (ADO_MCP_AUTH_TOKEN)`);

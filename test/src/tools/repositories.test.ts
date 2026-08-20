@@ -45,6 +45,10 @@ describe("repos tools", () => {
     updateRefs: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
     getItems: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
   };
+  let mockPolicyApi: {
+    getPolicyEvaluations: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
+    requeuePolicyEvaluation: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
+  };
 
   beforeEach(() => {
     server = {
@@ -77,8 +81,14 @@ describe("repos tools", () => {
       getItems: jest.fn(),
     };
 
+    mockPolicyApi = {
+      getPolicyEvaluations: jest.fn(),
+      requeuePolicyEvaluation: jest.fn(),
+    };
+
     connectionProvider = jest.fn().mockResolvedValue({
       getGitApi: jest.fn().mockResolvedValue(mockGitApi),
+      getPolicyApi: jest.fn().mockResolvedValue(mockPolicyApi),
     });
 
     userAgentProvider = () => "Jest";
@@ -6902,6 +6912,148 @@ describe("repos tools", () => {
           isError: true,
         });
       });
+    });
+  });
+
+  describe("repo_requeue_pull_request_build_policies", () => {
+    const PROJECT_ID = "11111111-1111-1111-1111-111111111111";
+    const BUILD_POLICY_TYPE_ID = "0609b952-1397-4640-95ec-e00a01b2c241";
+    const OTHER_POLICY_TYPE_ID = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd";
+
+    function getHandler() {
+      configureRepoTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === REPO_TOOLS.requeue_pull_request_build_policies);
+      if (!call) throw new Error("repo_requeue_pull_request_build_policies tool not registered");
+      const [, , , handler] = call;
+      return handler;
+    }
+
+    function buildEvaluation(overrides: Record<string, unknown> = {}) {
+      return {
+        evaluationId: "eval-1",
+        status: 3, // Rejected
+        configuration: { isBlocking: true, isEnabled: true, settings: {}, type: { id: BUILD_POLICY_TYPE_ID } },
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      mockGitApi.getPullRequest.mockResolvedValue({
+        pullRequestId: 42,
+        repository: { project: { id: PROJECT_ID } },
+      });
+    });
+
+    it("requeues a failed build policy and produces the expected PATCH payload", async () => {
+      const handler = getHandler();
+      const evaluation = buildEvaluation({ evaluationId: "eval-1", status: 3 });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([evaluation]);
+      mockPolicyApi.requeuePolicyEvaluation.mockResolvedValue({ ...evaluation, status: 0 });
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(mockPolicyApi.getPolicyEvaluations).toHaveBeenCalledWith("proj", `vstfs:///CodeReview/CodeReviewId/${PROJECT_ID}/42`, false);
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-1");
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.requeued).toEqual(["eval-1"]);
+      expect(parsed.skipped).toEqual([]);
+      expect(parsed.failed).toEqual([]);
+    });
+
+    it("does not requeue policies that are Approved, Queued, or Running by default", async () => {
+      const handler = getHandler();
+      const approved = buildEvaluation({ evaluationId: "eval-approved", status: 2 });
+      const queued = buildEvaluation({ evaluationId: "eval-queued", status: 0 });
+      const running = buildEvaluation({ evaluationId: "eval-running", status: 1 });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([approved, queued, running]);
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(mockPolicyApi.requeuePolicyEvaluation).not.toHaveBeenCalled();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.requeued).toEqual([]);
+      expect(parsed.skipped).toHaveLength(3);
+      expect(parsed.skipped.every((s: { reason: string }) => s.reason === "protected-status")).toBe(true);
+    });
+
+    it("filters out non-build policies even when they are in a failed state", async () => {
+      const handler = getHandler();
+      const nonBuild = buildEvaluation({ evaluationId: "eval-other", status: 3, configuration: { isBlocking: true, isEnabled: true, settings: {}, type: { id: OTHER_POLICY_TYPE_ID } } });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([nonBuild]);
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(mockPolicyApi.requeuePolicyEvaluation).not.toHaveBeenCalled();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.skipped).toEqual([{ evaluationId: "eval-other", reason: "not-a-build-policy", status: 3 }]);
+    });
+
+    it("requeues an explicitly selected evaluation even if it is Approved", async () => {
+      const handler = getHandler();
+      const approved = buildEvaluation({ evaluationId: "eval-approved", status: 2 });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([approved]);
+      mockPolicyApi.requeuePolicyEvaluation.mockResolvedValue({});
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42, evaluationIds: ["eval-approved"] });
+
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-approved");
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.requeued).toEqual(["eval-approved"]);
+    });
+
+    it("requeues every build policy when force is true, bypassing protection", async () => {
+      const handler = getHandler();
+      const running = buildEvaluation({ evaluationId: "eval-running", status: 1 });
+      const queued = buildEvaluation({ evaluationId: "eval-queued", status: 0 });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([running, queued]);
+      mockPolicyApi.requeuePolicyEvaluation.mockResolvedValue({});
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42, force: true });
+
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledTimes(2);
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-running");
+      expect(mockPolicyApi.requeuePolicyEvaluation).toHaveBeenCalledWith("proj", "eval-queued");
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.requeued.sort()).toEqual(["eval-queued", "eval-running"]);
+    });
+
+    it("returns an error when the pull request's project id cannot be resolved", async () => {
+      const handler = getHandler();
+      mockGitApi.getPullRequest.mockResolvedValue({ pullRequestId: 42, repository: {} });
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Could not resolve the project ID");
+      expect(mockPolicyApi.getPolicyEvaluations).not.toHaveBeenCalled();
+    });
+
+    it("returns an error when getPolicyEvaluations fails", async () => {
+      const handler = getHandler();
+      mockPolicyApi.getPolicyEvaluations.mockRejectedValue(new Error("Evaluations unavailable"));
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      expect(result).toEqual({
+        content: [{ type: "text", text: "Error requeuing pull request build policies: Evaluations unavailable" }],
+        isError: true,
+      });
+    });
+
+    it("reports a per-evaluation failure without throwing when requeuePolicyEvaluation fails", async () => {
+      const handler = getHandler();
+      const evaluation = buildEvaluation({ evaluationId: "eval-1", status: 3 });
+      mockPolicyApi.getPolicyEvaluations.mockResolvedValue([evaluation]);
+      mockPolicyApi.requeuePolicyEvaluation.mockRejectedValue(new Error("Server error"));
+
+      const result = await handler({ project: "proj", repositoryId: "repo123", pullRequestId: 42 });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.requeued).toEqual([]);
+      expect(parsed.failed).toEqual([{ evaluationId: "eval-1", error: "Server error" }]);
+      expect(result.isError).toBe(true);
     });
   });
 });

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "azure-devops-onprem": {
+      "command": "node",
+      "args": ["C:\\Users\\andresqa\\repos\\azure-devops-mcp\\dist\\index.js", "on-premises"]
+    }
+  }
+}
