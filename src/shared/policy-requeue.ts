@@ -17,7 +17,16 @@ export const BUILD_POLICY_TYPE_ID = "0609b952-1397-4640-95ec-e00a01b2c241";
 export const PROTECTED_STATUSES: ReadonlySet<PolicyEvaluationStatus> = new Set([PolicyEvaluationStatus.Approved, PolicyEvaluationStatus.Queued, PolicyEvaluationStatus.Running]);
 
 export function isBuildPolicyEvaluation(evaluation: PolicyEvaluationRecord): boolean {
-  return evaluation.configuration?.type?.id === BUILD_POLICY_TYPE_ID;
+  const typeId = evaluation.configuration?.type?.id?.toLowerCase();
+  const settings = evaluation.configuration?.settings as { buildDefinitionId?: unknown } | undefined;
+
+  // Some Azure DevOps Server versions omit configuration.type from policy evaluations,
+  // while still returning the build policy's characteristic buildDefinitionId setting.
+  return typeId === BUILD_POLICY_TYPE_ID || settings?.buildDefinitionId !== undefined;
+}
+
+export function isExpiredEvaluation(evaluation: PolicyEvaluationRecord): boolean {
+  return (evaluation.context as { isExpired?: unknown } | undefined)?.isExpired === true;
 }
 
 export function isProtectedStatus(status: PolicyEvaluationStatus | undefined): boolean {
@@ -33,8 +42,9 @@ export interface RequeueSelectionOptions {
 
 export interface SkippedEvaluation {
   evaluationId: string;
-  reason: "not-a-build-policy" | "not-selected" | "protected-status" | "missing-evaluation-id";
+  reason: "not-a-build-policy" | "not-selected" | "protected-status" | "not-applicable" | "missing-evaluation-id";
   status?: PolicyEvaluationStatus;
+  expired?: boolean;
 }
 
 export interface RequeueSelectionResult {
@@ -45,9 +55,10 @@ export interface RequeueSelectionResult {
 /**
  * Selects which build-policy evaluation records on a pull request should be requeued.
  *
- * Non build-policy evaluations are always skipped. Among build-policy evaluations, anything
- * in an Approved/Queued/Running state is skipped unless the caller explicitly listed its
- * evaluationId in `evaluationIds`, or passed `force: true`.
+ * Non build-policy and NotApplicable evaluations are always skipped. By default, failed/broken
+ * build policies and expired build policies are selected. Approved evaluations are protected
+ * only while they remain current; queued/running evaluations stay protected. Explicit selection
+ * and `force` preserve the opt-in escape hatch for applicable policies.
  */
 export function selectBuildPolicyEvaluationsToRequeue(evaluations: PolicyEvaluationRecord[], options: RequeueSelectionOptions = {}): RequeueSelectionResult {
   const { force = false } = options;
@@ -69,13 +80,21 @@ export function selectBuildPolicyEvaluationsToRequeue(evaluations: PolicyEvaluat
     }
 
     if (explicitSelection && !explicitSelection.has(evaluationId)) {
-      skipped.push({ evaluationId, reason: "not-selected", status: evaluation.status });
+      skipped.push({ evaluationId, reason: "not-selected", status: evaluation.status, expired: isExpiredEvaluation(evaluation) });
+      continue;
+    }
+
+    if (evaluation.status === PolicyEvaluationStatus.NotApplicable) {
+      skipped.push({ evaluationId, reason: "not-applicable", status: evaluation.status, expired: isExpiredEvaluation(evaluation) });
       continue;
     }
 
     const bypassProtection = force || explicitSelection !== null;
-    if (isProtectedStatus(evaluation.status) && !bypassProtection) {
-      skipped.push({ evaluationId, reason: "protected-status", status: evaluation.status });
+    const expired = isExpiredEvaluation(evaluation);
+    const active = evaluation.status === PolicyEvaluationStatus.Queued || evaluation.status === PolicyEvaluationStatus.Running;
+    const currentApproval = evaluation.status === PolicyEvaluationStatus.Approved && !expired;
+    if ((active || currentApproval) && !bypassProtection) {
+      skipped.push({ evaluationId, reason: "protected-status", status: evaluation.status, expired });
       continue;
     }
 

@@ -1602,7 +1602,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
   server.tool(
     REPO_TOOLS.requeue_pull_request_build_policies,
     "Requeue build validation policy evaluations for a pull request (works against Azure DevOps Services and on-premises Azure DevOps Server / TFS). " +
-      "By default, build policies that are already Approved, Queued, or Running are protected and left untouched. " +
+      "By default, expired, rejected, or broken build policies are requeued; current Approved, Queued, Running, and NotApplicable policies are left untouched. " +
+      "Use 'dryRun: true' to preview the exact evaluations without changing Azure DevOps. " +
       "Pass 'evaluationIds' to explicitly requeue specific evaluations regardless of their current state, or 'force: true' to requeue every build policy on the pull request.",
     {
       project: z.string().describe("Project ID or project name containing the pull request."),
@@ -1612,9 +1613,10 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
         .array(z.string())
         .optional()
         .describe("Explicit list of policy evaluation IDs to requeue. When provided, only these evaluations are considered, and they bypass the active-state protection."),
+      dryRun: z.boolean().optional().default(false).describe("When true, return the evaluations that would be requeued without changing Azure DevOps."),
       force: z.boolean().optional().default(false).describe("When true, requeue every build policy evaluation on the pull request, including ones that are Approved, Queued, or Running."),
     },
-    async ({ project, repositoryId, pullRequestId, evaluationIds, force }) => {
+    async ({ project, repositoryId, pullRequestId, evaluationIds, dryRun, force }) => {
       try {
         const connection = await connectionProvider();
         const gitApi = await connection.getGitApi();
@@ -1634,10 +1636,19 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
         const { toRequeue, skipped } = selectBuildPolicyEvaluationsToRequeue(evaluations, { evaluationIds, force });
 
+        const selected = toRequeue.map((evaluation) => ({
+          evaluationId: evaluation.evaluationId,
+          displayName: evaluation.configuration?.settings?.displayName ?? evaluation.configuration?.type?.displayName,
+          buildDefinitionId: evaluation.configuration?.settings?.buildDefinitionId,
+          status: evaluation.status,
+          expired: evaluation.context?.isExpired === true,
+          buildId: evaluation.context?.buildId,
+        }));
+
         const requeued: string[] = [];
         const failed: { evaluationId: string; error: string }[] = [];
 
-        for (const evaluation of toRequeue) {
+        for (const evaluation of dryRun ? [] : toRequeue) {
           const evaluationId = evaluation.evaluationId as string;
           try {
             await policyApi.requeuePolicyEvaluation(project, evaluationId);
@@ -1649,6 +1660,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
         const summary = {
           pullRequestId,
+          dryRun,
+          selected,
           requeued,
           skipped,
           failed,

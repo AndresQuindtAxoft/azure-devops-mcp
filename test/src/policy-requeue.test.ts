@@ -2,7 +2,14 @@
 // Licensed under the MIT License.
 
 import { PolicyEvaluationRecord, PolicyEvaluationStatus } from "azure-devops-node-api/interfaces/PolicyInterfaces.js";
-import { BUILD_POLICY_TYPE_ID, buildPullRequestArtifactId, isBuildPolicyEvaluation, isProtectedStatus, selectBuildPolicyEvaluationsToRequeue } from "../../src/shared/policy-requeue";
+import {
+  BUILD_POLICY_TYPE_ID,
+  buildPullRequestArtifactId,
+  isBuildPolicyEvaluation,
+  isExpiredEvaluation,
+  isProtectedStatus,
+  selectBuildPolicyEvaluationsToRequeue,
+} from "../../src/shared/policy-requeue";
 
 const OTHER_POLICY_TYPE_ID = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"; // Minimum number of reviewers
 
@@ -32,6 +39,17 @@ describe("policy-requeue helpers", () => {
 
     it("returns false when configuration/type is missing", () => {
       expect(isBuildPolicyEvaluation(buildEvaluation({ configuration: undefined }))).toBe(false);
+    });
+
+    it("recognizes an on-prem build policy by buildDefinitionId when type is omitted", () => {
+      expect(isBuildPolicyEvaluation(buildEvaluation({ configuration: { isBlocking: true, isEnabled: true, settings: { buildDefinitionId: 1361 } } }))).toBe(true);
+    });
+  });
+
+  describe("isExpiredEvaluation", () => {
+    it("reads the expiration flag from policy context", () => {
+      expect(isExpiredEvaluation(buildEvaluation({ context: { isExpired: true } }))).toBe(true);
+      expect(isExpiredEvaluation(buildEvaluation({ context: { isExpired: false } }))).toBe(false);
     });
   });
 
@@ -89,7 +107,25 @@ describe("policy-requeue helpers", () => {
       const result = selectBuildPolicyEvaluationsToRequeue([evaluation]);
 
       expect(result.toRequeue).toEqual([]);
-      expect(result.skipped).toEqual([{ evaluationId: "eval-3", reason: "protected-status", status }]);
+      expect(result.skipped).toEqual([{ evaluationId: "eval-3", reason: "protected-status", status, expired: false }]);
+    });
+
+    it("requeues an expired Approved build policy by default", () => {
+      const expired = buildEvaluation({ evaluationId: "eval-expired", status: PolicyEvaluationStatus.Approved, context: { isExpired: true, buildId: 123 } });
+
+      const result = selectBuildPolicyEvaluationsToRequeue([expired]);
+
+      expect(result.toRequeue).toEqual([expired]);
+      expect(result.skipped).toEqual([]);
+    });
+
+    it("never requeues a NotApplicable build policy", () => {
+      const notApplicable = buildEvaluation({ evaluationId: "eval-na", status: PolicyEvaluationStatus.NotApplicable, context: { isExpired: true } });
+
+      const result = selectBuildPolicyEvaluationsToRequeue([notApplicable], { force: true });
+
+      expect(result.toRequeue).toEqual([]);
+      expect(result.skipped).toEqual([{ evaluationId: "eval-na", reason: "not-applicable", status: PolicyEvaluationStatus.NotApplicable, expired: true }]);
     });
 
     it("does not protect a Rejected or Broken evaluation", () => {
@@ -118,7 +154,7 @@ describe("policy-requeue helpers", () => {
       const result = selectBuildPolicyEvaluationsToRequeue([rejected, other], { evaluationIds: ["eval-7"] });
 
       expect(result.toRequeue).toEqual([rejected]);
-      expect(result.skipped).toEqual([{ evaluationId: "eval-8", reason: "not-selected", status: other.status }]);
+      expect(result.skipped).toEqual([{ evaluationId: "eval-8", reason: "not-selected", status: other.status, expired: false }]);
     });
 
     it("bypasses protection for every build policy when force is true", () => {
