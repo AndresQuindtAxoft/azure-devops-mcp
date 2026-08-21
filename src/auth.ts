@@ -77,6 +77,21 @@ class OAuthAuthenticator {
 
 function createAuthenticator(type: string, tenantId?: string): () => Promise<string> {
   logger.debug(`Creating authenticator of type '${type}' with tenantId='${tenantId ?? "undefined"}'`);
+
+  // Reuse the ORCA-managed Azure DevOps token when present (e.g. on-premises Azure DevOps
+  // Server / TFS deployments provisioned by Orca). Takes precedence over --authentication.
+  // The token value itself is never logged or returned anywhere other than the auth header.
+  if (process.env.ORCA_AZURE_DEVOPS_TOKEN) {
+    logger.debug("Authenticator: Using ORCA_AZURE_DEVOPS_TOKEN environment variable");
+    return async () => {
+      const token = process.env.ORCA_AZURE_DEVOPS_TOKEN;
+      if (!token) {
+        throw new Error("Environment variable 'ORCA_AZURE_DEVOPS_TOKEN' is not set or empty.");
+      }
+      return token;
+    };
+  }
+
   switch (type) {
     case "envvar":
       logger.debug(`Authenticator: Using environment variable authentication (ADO_MCP_AUTH_TOKEN)`);
@@ -94,6 +109,16 @@ function createAuthenticator(type: string, tenantId?: string): () => Promise<str
 
     case "azcli":
     case "env":
+      // Check for PAT token in environment variable (for on-premise support)
+      const patToken = process.env.AZURE_DEVOPS_PAT;
+      if (patToken) {
+        // Return PAT token directly for on-premise or cloud scenarios
+        return async () => {
+          return patToken;
+        };
+      }
+
+      // Fallback to Azure credentials for cloud scenarios
       if (type !== "env") {
         logger.debug(`${type}: Setting AZURE_TOKEN_CREDENTIALS to 'dev' for development credential chain`);
         process.env.AZURE_TOKEN_CREDENTIALS = "dev";
@@ -108,7 +133,7 @@ function createAuthenticator(type: string, tenantId?: string): () => Promise<str
         const result = await credential.getToken(scopes);
         if (!result) {
           logger.error(`${type}: Failed to obtain token - credential.getToken returned null/undefined`);
-          throw new Error("Failed to obtain Azure DevOps token. Ensure you have Azure CLI logged or use interactive type of authentication.");
+          throw new Error("Failed to obtain Azure DevOps token. Ensure you have Azure CLI logged, set AZURE_DEVOPS_PAT environment variable, or use interactive type of authentication.");
         }
         logger.debug(`${type}: Successfully obtained Azure DevOps token`);
         return result.token;

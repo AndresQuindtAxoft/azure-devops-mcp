@@ -26,7 +26,9 @@ import { z } from "zod";
 import { getCurrentUserDetails, getUserIdFromEmail } from "./auth.js";
 import { GitRepository } from "azure-devops-node-api/interfaces/TfvcInterfaces.js";
 import { WebApiTagDefinition } from "azure-devops-node-api/interfaces/CoreInterfaces.js";
+import { PolicyEvaluationRecord } from "azure-devops-node-api/interfaces/PolicyInterfaces.js";
 import { getEnumKeys } from "../utils.js";
+import { buildPullRequestArtifactId, selectBuildPolicyEvaluationsToRequeue } from "../shared/policy-requeue.js";
 
 const REPO_TOOLS = {
   list_repos_by_project: "repo_list_repos_by_project",
@@ -49,6 +51,7 @@ const REPO_TOOLS = {
   list_pull_requests_by_commits: "repo_list_pull_requests_by_commits",
   vote_pull_request: "repo_vote_pull_request",
   list_directory: "repo_list_directory",
+  requeue_pull_request_build_policies: "repo_requeue_pull_request_build_policies",
 };
 
 function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) {
@@ -850,9 +853,9 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       try {
         const connection = await connectionProvider();
         const gitApi = await connection.getGitApi();
-        const branches = await gitApi.getRefs(repositoryId, undefined, "heads/", undefined, undefined, true, undefined, undefined, filterContains);
+        const branches = await gitApi.getRefs(repositoryId, undefined, undefined, undefined, undefined, true, undefined, undefined, undefined);
 
-        const filteredBranches = branchesFilterOutIrrelevantProperties(branches, top);
+        const filteredBranches = branchesFilterOutIrrelevantProperties(branches, top).filter((name) => !filterContains || name.includes(filterContains));
 
         return {
           content: [{ type: "text", text: JSON.stringify(filteredBranches, null, 2) }],
@@ -1590,6 +1593,90 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
         return {
           content: [{ type: "text", text: `Error listing directory: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    REPO_TOOLS.requeue_pull_request_build_policies,
+    "Requeue build validation policy evaluations for a pull request (works against Azure DevOps Services and on-premises Azure DevOps Server / TFS). " +
+      "By default, only expired build policies are requeued, including Azure DevOps Server evaluations represented as Queued + isExpired. " +
+      "Non-expired failures require explicit evaluationIds; NotApplicable policies are always excluded. " +
+      "Use 'dryRun: true' to preview the exact evaluations without changing Azure DevOps. " +
+      "Pass 'evaluationIds' to explicitly requeue specific evaluations regardless of their current state, or 'force: true' to requeue every build policy on the pull request.",
+    {
+      project: z.string().describe("Project ID or project name containing the pull request."),
+      repositoryId: z.string().describe("The ID of the repository containing the pull request."),
+      pullRequestId: z.number().describe("The ID of the pull request whose build policies should be requeued."),
+      evaluationIds: z
+        .array(z.string())
+        .optional()
+        .describe("Explicit list of policy evaluation IDs to requeue. When provided, only these evaluations are considered, and they bypass the active-state protection."),
+      dryRun: z.boolean().optional().default(false).describe("When true, return the evaluations that would be requeued without changing Azure DevOps."),
+      force: z.boolean().optional().default(false).describe("When true, requeue every build policy evaluation on the pull request, including ones that are Approved, Queued, or Running."),
+    },
+    async ({ project, repositoryId, pullRequestId, evaluationIds, dryRun, force }) => {
+      try {
+        const connection = await connectionProvider();
+        const gitApi = await connection.getGitApi();
+        const policyApi = await connection.getPolicyApi();
+
+        const pullRequest = await gitApi.getPullRequest(repositoryId, pullRequestId, project);
+        const projectId = pullRequest?.repository?.project?.id;
+        if (!projectId) {
+          return {
+            content: [{ type: "text", text: `Could not resolve the project ID for pull request #${pullRequestId}.` }],
+            isError: true,
+          };
+        }
+
+        const artifactId = buildPullRequestArtifactId(projectId, pullRequestId);
+        const evaluations: PolicyEvaluationRecord[] = (await policyApi.getPolicyEvaluations(project, artifactId, false)) ?? [];
+
+        const { toRequeue, skipped } = selectBuildPolicyEvaluationsToRequeue(evaluations, { evaluationIds, force });
+
+        const selected = toRequeue.map((evaluation) => ({
+          evaluationId: evaluation.evaluationId,
+          displayName: evaluation.configuration?.settings?.displayName ?? evaluation.configuration?.type?.displayName,
+          buildDefinitionId: evaluation.configuration?.settings?.buildDefinitionId,
+          status: evaluation.status,
+          expired: evaluation.context?.isExpired === true,
+          buildId: evaluation.context?.buildId,
+        }));
+
+        const requeued: string[] = [];
+        const failed: { evaluationId: string; error: string }[] = [];
+
+        for (const evaluation of dryRun ? [] : toRequeue) {
+          const evaluationId = evaluation.evaluationId as string;
+          try {
+            await policyApi.requeuePolicyEvaluation(project, evaluationId);
+            requeued.push(evaluationId);
+          } catch (error) {
+            failed.push({ evaluationId, error: error instanceof Error ? error.message : "Unknown error occurred" });
+          }
+        }
+
+        const summary = {
+          pullRequestId,
+          dryRun,
+          selected,
+          requeued,
+          skipped,
+          failed,
+        };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
+          isError: failed.length > 0 && requeued.length === 0 && toRequeue.length > 0,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+
+        return {
+          content: [{ type: "text", text: `Error requeuing pull request build policies: ${errorMessage}` }],
           isError: true,
         };
       }
